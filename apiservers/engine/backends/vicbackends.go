@@ -21,6 +21,10 @@ import (
 	"github.com/vmware/vic/apiservers/portlayer/client"
 )
 
+const (
+	Imagec = "imagec"
+)
+
 var (
 	portLayerClient     *client.PortLayer
 	portLayerServerAddr string
