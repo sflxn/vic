@@ -15,13 +15,18 @@
 package vicbackends
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/go-swagger/go-swagger/httpkit"
+	httptransport "github.com/go-swagger/go-swagger/httpkit/client"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types/backend"
@@ -34,12 +39,13 @@ import (
 	"github.com/docker/engine-api/types/strslice"
 
 	viccontainer "github.com/vmware/vic/apiservers/engine/backends/container"
+	"github.com/vmware/vic/apiservers/portlayer/client"
 	"github.com/vmware/vic/apiservers/portlayer/client/containers"
 	"github.com/vmware/vic/apiservers/portlayer/client/interaction"
 	"github.com/vmware/vic/apiservers/portlayer/client/scopes"
 	"github.com/vmware/vic/apiservers/portlayer/client/storage"
 	"github.com/vmware/vic/apiservers/portlayer/models"
-	"github.com/vmware/vic/pkg/attachutils"
+	//	"github.com/vmware/vic/pkg/attachutils"
 	"github.com/vmware/vic/pkg/trace"
 )
 
@@ -458,6 +464,8 @@ func (c *Container) Containers(config *types.ContainerListOptions) ([]*types.Con
 
 // ContainerAttach attaches to logs according to the config passed in. See ContainerAttachConfig.
 func (c *Container) ContainerAttach(prefixOrName string, ca *backend.ContainerAttachConfig) error {
+	defer trace.End(trace.Begin("ContainerAttach"))
+
 	vc := viccontainer.GetCache().GetContainerByName(prefixOrName)
 
 	//FIXME: Call the exec portlayer and get the current status of the container.
@@ -471,43 +479,60 @@ func (c *Container) ContainerAttach(prefixOrName string, ca *backend.ContainerAt
 		return derr.NewRequestNotFoundError(fmt.Errorf("No such container: %s", prefixOrName))
 	}
 
-	log.Printf("attach config = %#v", ca)
-	conn, br, err := attachutils.AttachToDockerLikeServer(
-		PortLayerServer(),
-		vc.ContainerID,
-		"attach",
-		ca.UseStdin, ca.UseStdout, ca.UseStderr, ca.Stream)
+	//	log.Printf("attach config = %#v", ca)
+	//	conn, br, err := attachutils.AttachToDockerLikeServer(
+	//		PortLayerServer(),
+	//		vc.ContainerID,
+	//		"attach",
+	//		ca.UseStdin, ca.UseStdout, ca.UseStderr, ca.Stream)
+
+	//	if err != nil {
+	//		log.Errorf("ContainerAttached received error attaching to portlayer: %s", err)
+	//		return err
+	//	}
+
+	clStdin, clStdout, clStderr, err := ca.GetStreams()
+
+	// replace the stdout/stderr with Docker's multiplex stream
+	mux := (!vc.Config.Tty && ca.MuxStreams)
+	if mux {
+		clStdout = stdcopy.NewStdWriter(clStderr, stdcopy.Stderr)
+		clStdout = stdcopy.NewStdWriter(clStdout, stdcopy.Stdout)
+	}
+
+	transport := httptransport.New(PortLayerServer(), "/", []string{"http"})
+	plClient := client.New(transport, nil)
+	transport.Consumers["application/json"] = httpkit.JSONConsumer()
+	transport.Producers["application/json"] = httpkit.JSONProducer()
+	transport.Consumers["application/octet-stream"] = httpkit.ByteStreamConsumer()
+	transport.Producers["application/octet-stream"] = httpkit.ByteStreamProducer()
+	//	plClient := PortLayerClient()
+
+	err = attachInputStream(plClient, vc.ContainerID, clStdin)
 
 	if err != nil {
-		log.Errorf("ContainerAttached received error attaching to portlayer: %s", err)
 		return err
 	}
 
-	inStream, outStream, errStream, err := ca.GetStreams()
-
-	// replace the stdout/stderr with Docker's multiplex stream
-	if !vc.Config.Tty && ca.MuxStreams {
-		errStream = stdcopy.NewStdWriter(errStream, stdcopy.Stderr)
-		outStream = stdcopy.NewStdWriter(outStream, stdcopy.Stdout)
-	}
+	err = attachOutputStreams(plClient, vc.ContainerID, clStdout, clStderr)
 
 	//	 Starts up the stream copying and wait for them to stop or error.  The
 	//	 streams are from the hijacked connection of this API server.  The conn
 	//	 is the connection to the portlayer server.
-	err = attachutils.AttachStreamsToConn(
-		vc.Config.OpenStdin,
-		vc.Config.StdinOnce,
-		vc.Config.Tty,
-		inStream,
-		outStream,
-		errStream,
-		conn,
-		br,
-		ca.DetachKeys)
+	//	err = attachutils.AttachStreamsToConn(
+	//		vc.Config.OpenStdin,
+	//		vc.Config.StdinOnce,
+	//		vc.Config.Tty,
+	//		clStdin,
+	//		clStdout,
+	//		clStderr,
+	//		conn,
+	//		br,
+	//		ca.DetachKeys)
 
-	if err != nil {
-		log.Errorf("ContainerAttach received error waiting on streams: %s", err)
-	}
+	//	if err != nil {
+	//		log.Errorf("ContainerAttach received error waiting on streams: %s", err)
+	//	}
 
 	return err
 }
@@ -670,4 +695,158 @@ func (c *Container) getContainerConfigFromExecPL(name string) (*container.Config
 	// Transform the portlayer info to docker compatible data and return
 
 	return nil, nil
+}
+
+func attachInputStream(plClient *client.PortLayer, name string, clStdin io.ReadCloser) error {
+	if plClient == nil {
+		return derr.NewErrorWithStatusCode(fmt.Errorf("Unknown error from the port layer"),
+			http.StatusInternalServerError)
+	}
+
+	//	setStdinParams := interaction.NewContainerSetStdinParamsWithTimeout(5 * time.Second).WithID(name).WithRawStream(clStdin)
+	//	setStdinParams := interaction.NewContainerSetStdinParams().WithID(name).WithRawStream(clStdin)
+
+	// Calling the portlayer to set the stdin stream will automatically attach them
+	go func() {
+		//		io.WriteString(w, "hello\n")
+		//		_, err := io.Copy(w, clStdin)
+
+		//		if err != nil {
+		//			log.Printf("Error copying stdin: %s", err)
+		//		}
+		setStdinParams := interaction.NewContainerSetStdinParamsWithTimeout(5 * time.Minute).WithID(name)
+		setStdinParams = setStdinParams.WithRawStream(ioutil.NopCloser(bytes.NewBufferString("hello\n\nabc\n\n\n\r\n\rhello, world")))
+		plClient.Interaction.ContainerSetStdin(setStdinParams)
+	}()
+
+	return nil
+	//	if err != nil {
+	//		if _, ok := err.(*interaction.ContainerSetStdinNotFound); ok {
+	//			return derr.NewRequestNotFoundError(fmt.Errorf("No such container: %s", name))
+	//		}
+
+	//		// If we get here, most likely something went wrong with the port layer API server
+	//		return derr.NewErrorWithStatusCode(fmt.Errorf("Unknown error from the interaction port layer: %s", err),
+	//			http.StatusInternalServerError)
+	//	}
+
+	//	return err
+}
+
+// getContainerStreamsFromPL assumes name is full name.  Resolve any partial name
+// before calling this function.
+//func (c *Container) getContainerStreamsFromPL(name string) (io.WriteCloser, io.Reader, io.Reader, err) {
+//}
+
+func attachOutputStreams(plClient *client.PortLayer, name string, clStdout, clStderr io.Writer) error {
+	var plStderr io.Reader
+	// Get an io.Reader for stdout from the interaction portlayer via Swagger
+	getStdoutParams := interaction.NewContainerGetStdoutParamsWithTimeout(2 * time.Minute).WithID(name)
+	stdoutResults, err := plClient.Interaction.ContainerGetStdout(getStdoutParams)
+
+	if err != nil {
+		if _, ok := err.(*interaction.ContainerGetStdoutNotFound); ok {
+			return derr.NewRequestNotFoundError(fmt.Errorf("No such container: %s", name))
+		}
+
+		// If we get here, most likely something went wrong with the port layer API server
+		return derr.NewErrorWithStatusCode(fmt.Errorf("Unknown error from the interaction port layer"),
+			http.StatusInternalServerError)
+	}
+
+	plStdout := stdoutResults.Payload
+	log.Printf("Got stdout: %#v", plStdout)
+
+	// Get an io.Reader for stderr from the interaction portlayer via Swagger
+	go func() {
+		getStderrParams := interaction.NewContainerGetStderrParams().WithID(name)
+		stderrResults, _ := plClient.Interaction.ContainerGetStderr(getStderrParams)
+		plStderr = stderrResults.Payload
+	}()
+
+	//	if err != nil {
+	//		if _, ok := err.(*interaction.ContainerGetStderrNotFound); ok {
+	//			return derr.NewRequestNotFoundError(fmt.Errorf("No such container: %s", name))
+	//		}
+
+	//		// If we get here, most likely something went wrong with the port layer API server
+	//		return derr.NewErrorWithStatusCode(fmt.Errorf("Unknown error from the interaction port layer"),
+	//			http.StatusInternalServerError)
+	//	}
+
+	// Do the actual attach
+	//	attachStream := func(name string, clWriter io.Writer, plReader io.Reader, errChan chan<- error) {
+	//		log.Debugf("attach: %s: begin", name)
+	//		_, err := io.Copy(clWriter, plReader)
+	//		if err == io.ErrClosedPipe {
+	//			err = nil
+	//		}
+	//		if err != nil {
+	//			log.Errorf("attach: %s: %v", name, err)
+	//		}
+	//		log.Debugf("attach: %s: end", name)
+
+	//		errChan <- err
+	//	}
+
+	//	outChan := make(chan error)
+	//	errChan := make(chan error)
+	//	go attachStream("stdout", clStdout, plStdout, outChan)
+	//	go attachStream("stderr", clStderr, plStderr, errChan)
+
+	//	select {
+	//	case err := <-outChan:
+	//		return err
+	//	case err := <-errChan:
+	//		return err
+	//	}
+	return nil
+}
+
+// Code c/c from io.Copy() modified to handle escape sequence
+func copyEscapable(dst io.Writer, src io.ReadCloser, keys []byte) (written int64, err error) {
+	if len(keys) == 0 {
+		// Default keys : ctrl-p ctrl-q
+		keys = []byte{16, 17}
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			// ---- Docker addition
+			for i, key := range keys {
+				if nr != 1 || buf[0] != key {
+					break
+				}
+				if i == len(keys)-1 {
+					if err := src.Close(); err != nil {
+						return 0, err
+					}
+					return 0, nil
+				}
+				nr, er = src.Read(buf)
+			}
+			// ---- End of docker
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er == io.EOF {
+			break
+		}
+		if er != nil {
+			err = er
+			break
+		}
+	}
+	return written, err
 }

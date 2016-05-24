@@ -16,12 +16,17 @@ package handlers
 
 import (
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"os"
 	"time"
 
 	"golang.org/x/net/context"
 
 	log "github.com/Sirupsen/logrus"
 
+	"github.com/go-swagger/go-swagger/httpkit"
 	middleware "github.com/go-swagger/go-swagger/httpkit/middleware"
 	"github.com/vmware/vic/apiservers/portlayer/models"
 	"github.com/vmware/vic/apiservers/portlayer/restapi/operations"
@@ -44,6 +49,10 @@ func (i *InteractionHandlersImpl) Configure(api *operations.PortLayerAPI, _ *Han
 	var err error
 
 	api.InteractionContainerResizeHandler = interaction.ContainerResizeHandlerFunc(i.ContainerResizeHandler)
+	api.InteractionContainerSetStdinHandler = interaction.ContainerSetStdinHandlerFunc(i.ContainerSetStdinHandler)
+	api.InteractionContainerGetStdoutHandler = interaction.ContainerGetStdoutHandlerFunc(i.ContainerGetStdoutHandler)
+	api.InteractionContainerGetStderrHandler = interaction.ContainerGetStderrHandlerFunc(i.ContainerGetStderrHandler)
+	api.InteractionContainerDetachStdioHandler = interaction.ContainerDetachStdioHandlerFunc(i.ContainerDetachStdioHandler)
 
 	ctx := context.Background()
 
@@ -97,4 +106,95 @@ func (i *InteractionHandlersImpl) ContainerResizeHandler(params interaction.Cont
 	}
 
 	return interaction.NewContainerResizeOK()
+}
+
+func (i *InteractionHandlersImpl) ContainerSetStdinHandler(params interaction.ContainerSetStdinParams) middleware.Responder {
+	log.Printf("Attempting to get ssh session for container %s", params.ID)
+	// Get the ssh session streams
+	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
+
+	if err != nil {
+		e := &models.Error{Message: fmt.Sprintf("No stdin found for %s", params.ID)}
+		return interaction.NewContainerSetStdinNotFound().WithPayload(e)
+	} else {
+		go func() {
+			_, err := io.Copy(sshConn.Stdin(), params.RawStream)
+
+			if err != nil {
+				log.Printf("Error copying stdin for container %s", params.ID)
+			}
+		}()
+	}
+
+	return interaction.NewContainerSetStdinOK()
+}
+
+func (i *InteractionHandlersImpl) ContainerGetStdoutHandler(params interaction.ContainerGetStdoutParams) middleware.Responder {
+	log.Printf("Attempting to get ssh session for container %s", params.ID)
+	// Get the ssh session streams
+	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
+
+	if err != nil {
+		e := &models.Error{Message: fmt.Sprintf("No stdout found for %s", params.ID)}
+		return interaction.NewContainerGetStdoutNotFound().WithPayload(e)
+	} else {
+		return NewContainerOutputHandler().WithPayload(sshConn.Stdout(), params.ID)
+	}
+
+	return interaction.NewContainerGetStdoutOK().WithPayload(ioutil.NopCloser(sshConn.Stdout()))
+}
+
+func (i *InteractionHandlersImpl) ContainerGetStderrHandler(params interaction.ContainerGetStderrParams) middleware.Responder {
+	log.Printf("Attempting to get ssh session for container %s", params.ID)
+	// Get the ssh session streams
+	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
+
+	if err != nil {
+		e := &models.Error{Message: fmt.Sprintf("No stderr found for %s", params.ID)}
+		return interaction.NewContainerGetStderrNotFound().WithPayload(e)
+	} else {
+		return NewContainerOutputHandler().WithPayload(sshConn.Stderr(), params.ID)
+	}
+
+	return interaction.NewContainerGetStderrOK()
+}
+
+func (i *InteractionHandlersImpl) ContainerDetachStdioHandler(params interaction.ContainerDetachStdioParams) middleware.Responder {
+	log.Printf("Attempting to get ssh session for container %s", params.ID)
+	// Get the ssh session streams
+	//	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
+
+	return interaction.NewContainerDetachStdioOK()
+}
+
+// Custom return handlers for stdout/stderr
+
+type ContainerOutputHandler struct {
+	outputStream io.Reader
+	containerId  string
+}
+
+// NewContainerSetStdinInternalServerError creates ContainerSetStdinInternalServerError with default headers values
+func NewContainerOutputHandler() *ContainerOutputHandler {
+	return &ContainerOutputHandler{}
+}
+
+// WithPayload adds the payload to the container set stdin internal server error response
+func (o *ContainerOutputHandler) WithPayload(payload io.Reader, id string) *ContainerOutputHandler {
+	o.outputStream = payload
+	o.containerId = id
+	return o
+}
+
+// WriteResponse to the client
+func (o *ContainerOutputHandler) WriteResponse(rw http.ResponseWriter, producer httpkit.Producer) {
+	rw.WriteHeader(200)
+	rw.Header().Set("Content-Type", "application/octet-streaming")
+	rw.Header().Set("Transfer-Encoding", "chunked")
+	mw := io.MultiWriter(os.Stdout, rw)
+	_, err := io.Copy(mw, o.outputStream)
+
+	if err != nil {
+		log.Printf("Error copying output for container %s: %s", o.containerId, err)
+	}
 }
