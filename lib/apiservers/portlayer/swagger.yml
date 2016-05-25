@@ -566,7 +566,7 @@ paths:
           description: "OK"
   /interaction/{id}/stdin:
     post:
-      definitions: "Set a stdin for the container"
+      description: "Set a stdin for the container"
       summary: "Set stdin"
       operationId: ContainerSetStdin
       tags: ["interaction"]
@@ -596,7 +596,7 @@ paths:
           description: "OK"
   /interaction/{id}/stdout:
     get:
-      definitions: "Get a stdout for the container"
+      description: "Get a stdout for the container"
       summary: "Get stdout"
       operationId: ContainerGetStdout
       tags: ["interaction"]
@@ -624,7 +624,7 @@ paths:
             format: binary
   /interaction/{id}/stderr:
     get:
-      definitions: "Get a stderr for the container"
+      description: "Get a stderr for the container"
       summary: "Get stderr"
       operationId: ContainerGetStderr
       tags: ["interaction"]
@@ -650,11 +650,11 @@ paths:
           description: "OK"
           schema:
             format: binary
-  /interaction/{id}/sdtio:
-    delete:
-      definitions: "Detatches all sdio streams to/from the container"
-      summary: "Detaches the stream"
-      operationId: ContainerDetachStdio
+  /interaction/{id}/detach:
+    post:
+      description: "Detaches the streams to the VIC container without closing down the streams"
+      summary: "Detach streams without closing them"
+      operationId: ContainerDetach
       tags: ["interaction"]
       consumes:
         - application/octet-stream
@@ -665,7 +665,7 @@ paths:
           in: path
           type: string
           required: true
-      responses:    
+      responses:
         '500':
           description: "Failed to detach"
           schema:
@@ -675,7 +675,7 @@ paths:
           schema:
             $ref: "#/definitions/Error"
         '200':
-          description: "OK"    
+          description: "OK"
 definitions:
   Error:
     type: object

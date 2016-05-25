@@ -15,9 +15,9 @@
 package handlers
 
 import (
+	//	"bufio"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"time"
@@ -28,17 +28,20 @@ import (
 
 	"github.com/go-swagger/go-swagger/httpkit"
 	middleware "github.com/go-swagger/go-swagger/httpkit/middleware"
-	"github.com/vmware/vic/apiservers/portlayer/models"
-	"github.com/vmware/vic/apiservers/portlayer/restapi/operations"
-	"github.com/vmware/vic/apiservers/portlayer/restapi/operations/interaction"
-	"github.com/vmware/vic/apiservers/portlayer/restapi/options"
+	"github.com/vmware/vic/lib/apiservers/portlayer/models"
+	"github.com/vmware/vic/lib/apiservers/portlayer/restapi/operations"
+	"github.com/vmware/vic/lib/apiservers/portlayer/restapi/operations/interaction"
+	"github.com/vmware/vic/lib/apiservers/portlayer/restapi/options"
+	"github.com/vmware/vic/lib/portlayer/attach"
 	"github.com/vmware/vic/pkg/vsphere/session"
-	"github.com/vmware/vic/portlayer/attach"
 )
 
 // ExecHandlersImpl is the receiver for all of the exec handler methods
 type InteractionHandlersImpl struct {
 	attachServer *attach.Server
+	inStreamMap  map[string]*DetachableReader
+	outStreamMap map[string]*DetachableReader
+	errStreamMap map[string]*DetachableReader
 }
 
 var (
@@ -52,10 +55,9 @@ func (i *InteractionHandlersImpl) Configure(api *operations.PortLayerAPI, _ *Han
 	api.InteractionContainerSetStdinHandler = interaction.ContainerSetStdinHandlerFunc(i.ContainerSetStdinHandler)
 	api.InteractionContainerGetStdoutHandler = interaction.ContainerGetStdoutHandlerFunc(i.ContainerGetStdoutHandler)
 	api.InteractionContainerGetStderrHandler = interaction.ContainerGetStderrHandlerFunc(i.ContainerGetStderrHandler)
-	api.InteractionContainerDetachStdioHandler = interaction.ContainerDetachStdioHandlerFunc(i.ContainerDetachStdioHandler)
+	api.InteractionContainerDetachHandler = interaction.ContainerDetachHandlerFunc(i.ContainerDetachHandler)
 
 	ctx := context.Background()
-
 	sessionconfig := &session.Config{
 		Service:        options.PortLayerOptions.SDK,
 		Insecure:       options.PortLayerOptions.Insecure,
@@ -66,6 +68,10 @@ func (i *InteractionHandlersImpl) Configure(api *operations.PortLayerAPI, _ *Han
 		DatastorePath:  options.PortLayerOptions.DatastorePath,
 		NetworkPath:    options.PortLayerOptions.NetworkPath,
 	}
+
+	i.inStreamMap = make(map[string]*DetachableReader)
+	i.outStreamMap = make(map[string]*DetachableReader)
+	i.errStreamMap = make(map[string]*DetachableReader)
 
 	interactionSession, err = session.NewSession(sessionconfig).Create(ctx)
 	if err != nil {
@@ -80,26 +86,19 @@ func (i *InteractionHandlersImpl) Configure(api *operations.PortLayerAPI, _ *Han
 	}
 }
 
-func (i *InteractionHandlersImpl) GetServer() *attach.Server {
-	return i.attachServer
-}
-
 func (i *InteractionHandlersImpl) ContainerResizeHandler(params interaction.ContainerResizeParams) middleware.Responder {
 	// Get the ssh session to the container
 	connContainer, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
-
 	if err != nil {
 		retErr := &models.Error{Message: fmt.Sprintf("No such container: %s", params.ID)}
 		return interaction.NewContainerResizeNotFound().WithPayload(retErr)
 	}
 
 	// Request a resize
-
 	cWidth := uint32(params.Width)
 	cHeight := uint32(params.Height)
 
 	err = connContainer.Resize(cWidth, cHeight, 0, 0)
-
 	if err != nil {
 		retErr := &models.Error{Message: "SSH Session failed to resize the container's TTY"}
 		return interaction.NewContainerResizeInternalServerError().WithPayload(retErr)
@@ -109,69 +108,142 @@ func (i *InteractionHandlersImpl) ContainerResizeHandler(params interaction.Cont
 }
 
 func (i *InteractionHandlersImpl) ContainerSetStdinHandler(params interaction.ContainerSetStdinParams) middleware.Responder {
-	log.Printf("Attempting to get ssh session for container %s", params.ID)
-	// Get the ssh session streams
+	log.Printf("Attempting to get ssh session for container %s stdin", params.ID)
 	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
-
 	if err != nil {
 		e := &models.Error{Message: fmt.Sprintf("No stdin found for %s", params.ID)}
 		return interaction.NewContainerSetStdinNotFound().WithPayload(e)
-	} else {
-		go func() {
-			_, err := io.Copy(sshConn.Stdin(), params.RawStream)
-
-			if err != nil {
-				log.Printf("Error copying stdin for container %s", params.ID)
-			}
-		}()
 	}
+
+	detachableIn := NewDetachableReader(params.RawStream)
+	i.inStreamMap[params.ID] = detachableIn
+	_, err = io.Copy(sshConn.Stdin(), detachableIn)
+	if err != nil {
+		log.Printf("Error copying stdin for container %s", params.ID)
+	}
+
+	log.Printf("*Done copying stdin")
 
 	return interaction.NewContainerSetStdinOK()
 }
 
 func (i *InteractionHandlersImpl) ContainerGetStdoutHandler(params interaction.ContainerGetStdoutParams) middleware.Responder {
-	log.Printf("Attempting to get ssh session for container %s", params.ID)
-	// Get the ssh session streams
+	log.Printf("Attempting to get ssh session for container %s stdout", params.ID)
 	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
-
 	if err != nil {
 		e := &models.Error{Message: fmt.Sprintf("No stdout found for %s", params.ID)}
 		return interaction.NewContainerGetStdoutNotFound().WithPayload(e)
-	} else {
-		return NewContainerOutputHandler().WithPayload(sshConn.Stdout(), params.ID)
 	}
 
-	return interaction.NewContainerGetStdoutOK().WithPayload(ioutil.NopCloser(sshConn.Stdout()))
+	detachableOut := NewDetachableReader(sshConn.Stdout())
+	i.outStreamMap[params.ID] = detachableOut
+	return NewContainerOutputHandler().WithPayload(detachableOut, params.ID)
 }
 
 func (i *InteractionHandlersImpl) ContainerGetStderrHandler(params interaction.ContainerGetStderrParams) middleware.Responder {
-	log.Printf("Attempting to get ssh session for container %s", params.ID)
-	// Get the ssh session streams
+	log.Printf("Attempting to get ssh session for container %s stderr", params.ID)
 	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
-
 	if err != nil {
 		e := &models.Error{Message: fmt.Sprintf("No stderr found for %s", params.ID)}
 		return interaction.NewContainerGetStderrNotFound().WithPayload(e)
-	} else {
-		return NewContainerOutputHandler().WithPayload(sshConn.Stderr(), params.ID)
 	}
 
-	return interaction.NewContainerGetStderrOK()
+	detachableErr := NewDetachableReader(sshConn.Stderr())
+	i.outStreamMap[params.ID] = detachableErr
+	return NewContainerOutputHandler().WithPayload(detachableErr, params.ID)
 }
 
-func (i *InteractionHandlersImpl) ContainerDetachStdioHandler(params interaction.ContainerDetachStdioParams) middleware.Responder {
-	log.Printf("Attempting to get ssh session for container %s", params.ID)
-	// Get the ssh session streams
-	//	sshConn, err := i.attachServer.Get(context.Background(), params.ID, 600*time.Second)
+func (i *InteractionHandlersImpl) ContainerDetachHandler(params interaction.ContainerDetachParams) middleware.Responder {
+	if inReader, ok := i.inStreamMap[params.ID]; ok {
+		inReader.Detach()
+		delete(i.inStreamMap, params.ID)
+	}
+	if outReader, ok := i.outStreamMap[params.ID]; ok {
+		outReader.Detach()
+		delete(i.outStreamMap, params.ID)
+	}
+	if errReader, ok := i.errStreamMap[params.ID]; ok {
+		errReader.Detach()
+		delete(i.errStreamMap, params.ID)
+	}
 
-	return interaction.NewContainerDetachStdioOK()
+	return interaction.NewContainerDetachOK()
+}
+
+// Custom reader to allow us to detach cleanly during an io.Copy
+
+type GenericFlusher interface {
+	Flush()
+}
+
+type DetachableReader struct {
+	io.Reader
+	io.WriterTo
+
+	detached bool
+	flusher  GenericFlusher
+}
+
+func NewDetachableReader(rdr io.Reader) *DetachableReader {
+	return &DetachableReader{Reader: rdr, detached: false, flusher: nil}
+}
+
+func (d *DetachableReader) Detach() {
+	d.detached = true
+}
+
+func (d *DetachableReader) AddFlusher(flusher GenericFlusher) {
+	d.flusher = flusher
+}
+
+// Derived from go's io.Copy
+func (d *DetachableReader) WriteTo(w io.Writer) (written int64, err error) {
+	buf := make([]byte, 64)
+
+	for {
+		if d.detached {
+			err = nil
+			break
+		}
+		nr, er := d.Read(buf)
+		if nr > 0 {
+			if d.detached {
+				err = nil
+				break
+			}
+			nw, ew := w.Write(buf[0:nr])
+			os.Stdout.Write(buf[0:nr])
+			if d.flusher != nil {
+				d.flusher.Flush()
+			}
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er == io.EOF {
+			break
+		}
+		if er != nil {
+			err = er
+			break
+		}
+	}
+	return written, err
 }
 
 // Custom return handlers for stdout/stderr
 
 type ContainerOutputHandler struct {
-	outputStream io.Reader
-	containerId  string
+	outputStream *DetachableReader
+	containerID  string
 }
 
 // NewContainerSetStdinInternalServerError creates ContainerSetStdinInternalServerError with default headers values
@@ -180,21 +252,29 @@ func NewContainerOutputHandler() *ContainerOutputHandler {
 }
 
 // WithPayload adds the payload to the container set stdin internal server error response
-func (o *ContainerOutputHandler) WithPayload(payload io.Reader, id string) *ContainerOutputHandler {
-	o.outputStream = payload
-	o.containerId = id
-	return o
+func (c *ContainerOutputHandler) WithPayload(payload *DetachableReader, id string) *ContainerOutputHandler {
+	c.outputStream = payload
+	c.containerID = id
+	return c
+}
+
+func (c *ContainerOutputHandler) DetachReader() {
+	c.outputStream.Detach()
 }
 
 // WriteResponse to the client
-func (o *ContainerOutputHandler) WriteResponse(rw http.ResponseWriter, producer httpkit.Producer) {
-	rw.WriteHeader(200)
+func (c *ContainerOutputHandler) WriteResponse(rw http.ResponseWriter, producer httpkit.Producer) {
+	rw.WriteHeader(http.StatusOK)
 	rw.Header().Set("Content-Type", "application/octet-streaming")
 	rw.Header().Set("Transfer-Encoding", "chunked")
-	mw := io.MultiWriter(os.Stdout, rw)
-	_, err := io.Copy(mw, o.outputStream)
+	if f, ok := rw.(http.Flusher); ok {
+		c.outputStream.AddFlusher(f)
+	}
+	_, err := io.Copy(rw, c.outputStream)
 
 	if err != nil {
-		log.Printf("Error copying output for container %s: %s", o.containerId, err)
+		log.Printf("Error copying output for container %s: %s", c.containerID, err)
+	} else {
+		log.Printf("Finished copying stream for container %s", c.containerID)
 	}
 }

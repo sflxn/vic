@@ -25,16 +25,9 @@ import (
 	httpkit "github.com/go-swagger/go-swagger/httpkit"
 	"github.com/go-swagger/go-swagger/swag"
 
-<<<<<<< HEAD:lib/apiservers/portlayer/restapi/configure_port_layer.go
 	"github.com/vmware/vic/lib/apiservers/portlayer/restapi/handlers"
 	"github.com/vmware/vic/lib/apiservers/portlayer/restapi/operations"
 	"github.com/vmware/vic/lib/apiservers/portlayer/restapi/options"
-=======
-	"github.com/vmware/vic/apiservers/portlayer/restapi/handlers"
-	"github.com/vmware/vic/apiservers/portlayer/restapi/middleware"
-	"github.com/vmware/vic/apiservers/portlayer/restapi/operations"
-	"github.com/vmware/vic/apiservers/portlayer/restapi/options"
->>>>>>> 00ef197... Implmented Docker Attach (API, Port REST server):apiservers/portlayer/restapi/configure_port_layer.go
 	"github.com/vmware/vic/pkg/vsphere/session"
 )
 
@@ -116,15 +109,5 @@ func setupMiddlewares(handler http.Handler) http.Handler {
 // The middleware configuration happens before anything, this middleware also applies to serving the swagger.json document.
 // So this is a good place to plug in a panic handling middleware, logging and metrics
 func setupGlobalMiddleware(handler http.Handler) http.Handler {
-	if plHandler, exist := portlayerhandlers["interaction"]; exist {
-		if attachHandler, isa := plHandler.(*handlers.InteractionHandlersImpl); isa {
-			return middleware.NewAttachHijacker(handler, attachHandler.GetServer())
-		} else {
-			log.Fatalf("Attach handler not found!")
-			return handler
-		}
-	} else {
-		log.Fatalf("Attach handler not found!")
-		return handler
-	}
+	return handler
 }
