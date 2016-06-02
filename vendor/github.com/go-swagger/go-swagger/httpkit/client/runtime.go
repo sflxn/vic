@@ -179,7 +179,10 @@ func (r *Runtime) Submit(operation *client.Operation) (interface{}, error) {
 		fmt.Println(string(b))
 	}
 
-	pctx := r.Context
+	pctx := operation.Context
+	if pctx == nil {
+		pctx = r.Context
+	}
 	if pctx == nil {
 		pctx = context.Background()
 	}
