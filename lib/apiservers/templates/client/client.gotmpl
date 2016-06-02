@@ -54,7 +54,8 @@ func (a *Client) {{ pascalize .Name }}(params *{{ pascalize .Name }}Params{{ if 
     Schemes: {{ printf "%#v" .Schemes }},
     Params: params,
     Reader: &{{ pascalize .Name }}Reader{formats: a.formats{{ if .HasStreamingResponse }}, writer: writer{{ end }}},{{ if .Authorized }}
-    AuthInfo: authInfo,{{ end}}
+    AuthInfo: authInfo,
+    Context: params.Context,{{ end}}
   })
   if err != nil {
     return {{ if .SuccessResponse }}nil, {{ end }}err
