@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/go-swagger/go-swagger/httpkit"
 	httptransport "github.com/go-swagger/go-swagger/httpkit/client"
 
@@ -537,14 +539,9 @@ func (c *Container) ContainerAttach(prefixOrName string, ca *backend.ContainerAt
 
 	if !vc.Config.Tty && ca.MuxStreams {
 		// replace the stdout/stderr with Docker's multiplex stream
-		clStdout = stdcopy.NewStdWriter(clStderr, stdcopy.Stderr)
+		clStderr = stdcopy.NewStdWriter(clStderr, stdcopy.Stderr)
 		clStdout = stdcopy.NewStdWriter(clStdout, stdcopy.Stdout)
 	}
-
-	transport := httptransport.New(PortLayerServer(), "/", []string{"http"})
-	plClient := client.New(transport, nil)
-	transport.Consumers["application/octet-stream"] = httpkit.ByteStreamConsumer()
-	transport.Producers["application/octet-stream"] = httpkit.ByteStreamProducer()
 
 	if !ca.UseStdin {
 		clStdin = nil
@@ -556,7 +553,7 @@ func (c *Container) ContainerAttach(prefixOrName string, ca *backend.ContainerAt
 		clStderr = nil
 	}
 
-	err = attachStreams(plClient, vc.ContainerID, vc.Config.Tty, vc.Config.StdinOnce, clStdin, clStdout, clStderr, ca.DetachKeys)
+	err = attachStreams(vc.ContainerID, vc.Config.Tty, vc.Config.StdinOnce, clStdin, clStdout, clStderr, ca.DetachKeys)
 
 	return err
 }
@@ -689,86 +686,15 @@ func (c *Container) getImageMetadataFromStoragePL(image string) (*viccontainer.V
 	return imageMetadata, nil
 }
 
-type DetachableWriter struct {
-	io.Writer
-	io.ReaderFrom
-
-	detachChan chan struct{}
-	detached   bool
-	streamName string
-}
-
-func NewDetachableWriter(dst io.Writer, name string) *DetachableWriter {
-	dw := &DetachableWriter{Writer: dst, detached: false, detachChan: make(chan struct{}), streamName: name}
-
-	return dw
-}
-
-func (s *DetachableWriter) Detach() {
-	s.detached = true
-	s.detachChan <- struct{}{}
-}
-
-// Code copied from io.Copy and repurposed and modified for ReadFrom()
-func (s *DetachableWriter) ReadFrom(r io.Reader) (written int64, err error) {
-	buf := make([]byte, 64)
-	written = 0
-
-	if rc, ok := r.(io.Closer); ok {
-		go func() {
-			select {
-			case <-s.detachChan:
-				rc.Close()
-				log.Printf("Detaching from %s...", s.streamName)
-			}
-		}()
-	}
-
-	for {
-		if s.detached {
-			err = nil
-			break
-		}
-		nr, er := r.Read(buf)
-		if nr > 0 {
-			if s.detached {
-				err = nil
-				break
-			}
-			nw, ew := s.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er == io.EOF {
-			break
-		}
-		if er != nil {
-			err = er
-			break
-		}
-	}
-	return written, err
-}
-
-func attachStreams(plClient *client.PortLayer, name string, tty, stdinOnce bool, clStdin io.ReadCloser, clStdout, clStderr io.Writer, keys []byte) error {
-	if plClient == nil {
-		return derr.NewErrorWithStatusCode(fmt.Errorf("Unknown error from the port layer"),
-			http.StatusInternalServerError)
-	}
-
-	var clientOutWriter, clientErrWriter *DetachableWriter
+func attachStreams(name string, tty, stdinOnce bool, clStdin io.ReadCloser, clStdout, clStderr io.Writer, keys []byte) error {
 	var wg sync.WaitGroup
 
 	errors := make(chan error, 3)
+	//FIXME: Swagger will timeout on us.  We need to either have an infinite timeout or the timeout should
+	// start after some inactivity?
+	inContext, inCancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	outContext, outCancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	errContext, errCancel := context.WithTimeout(context.Background(), 2*time.Hour)
 
 	// Create writers that will redirect copying to the writer we really want to
 	// write to.  These redirect writers will allow us to close
@@ -776,16 +702,10 @@ func attachStreams(plClient *client.PortLayer, name string, tty, stdinOnce bool,
 		wg.Add(1)
 	}
 	if clStdout != nil {
-		clientOutWriter = NewDetachableWriter(clStdout, "stdout")
 		wg.Add(1)
-	} else {
-		clientOutWriter = nil
 	}
 	if clStderr != nil {
-		clientErrWriter = NewDetachableWriter(clStderr, "stderr")
 		wg.Add(1)
-	} else {
-		clientErrWriter = nil
 	}
 
 	if clStdin != nil {
@@ -795,12 +715,15 @@ func attachStreams(plClient *client.PortLayer, name string, tty, stdinOnce bool,
 		defer clStdin.Close()
 		defer stdinReader.Close()
 
+		transport := httptransport.New(PortLayerServer(), "/", []string{"http"})
+		plClient := client.New(transport, nil)
+		transport.Consumers["application/octet-stream"] = httpkit.ByteStreamConsumer()
+		transport.Producers["application/octet-stream"] = httpkit.ByteStreamProducer()
+
 		// Swagger wants an io.reader so give it the reader pipe.  Also, the swagger call
 		// to set the stdin is synchronous so we need to run in a goroutine
 		go func() {
-			//FIXME: Swagger will timeout on us.  We need to either have an infinite timeout or the timeout should
-			// start after some inactivity?
-			setStdinParams := interaction.NewContainerSetStdinParamsWithTimeout(2 * time.Hour).WithID(name)
+			setStdinParams := interaction.NewContainerSetStdinParamsWithContext(inContext).WithID(name)
 			setStdinParams = setStdinParams.WithRawStream(stdinReader)
 			plClient.Interaction.ContainerSetStdin(setStdinParams)
 		}()
@@ -827,22 +750,29 @@ func attachStreams(plClient *client.PortLayer, name string, tty, stdinOnce bool,
 				// current Docker behavior?
 				stdinReader.Close()
 			} else {
-				// Tell portlayer to close down the connections
-				detachStream(plClient, name)
-				clientOutWriter.Detach()
-				clientErrWriter.Detach()
+				// Shutdown the client's request for stdout, stderr
+				errCancel()
+				outCancel()
 			}
 			wg.Done()
 		}()
 	}
 
-	if clientOutWriter != nil {
+	if clStdout != nil {
+		transport := httptransport.New(PortLayerServer(), "/", []string{"http"})
+		plClient := client.New(transport, nil)
+		transport.Consumers["application/octet-stream"] = httpkit.ByteStreamConsumer()
+		transport.Producers["application/octet-stream"] = httpkit.ByteStreamProducer()
+
 		// Swagger -> pipewriter.  Synchronous, blocking call
 		go func() {
-			//FIXME: Swagger will timeout on us.  We need to either have an infinite timeout or the timeout should
-			// start after some inactivity?
-			getStdoutParams := interaction.NewContainerGetStdoutParamsWithTimeout(2 * time.Hour).WithID(name)
-			_, err := plClient.Interaction.ContainerGetStdout(getStdoutParams, clientOutWriter)
+			getStdoutParams := interaction.NewContainerGetStdoutParamsWithContext(outContext).WithID(name)
+			_, err := plClient.Interaction.ContainerGetStdout(getStdoutParams, clStdout)
+			if clStdin != nil {
+				// Close the client stdin connection (e.g. CLI)
+				clStdin.Close()
+				inCancel()
+			}
 			if err != nil {
 				if _, ok := err.(*interaction.ContainerGetStdoutNotFound); ok {
 					errors <- derr.NewRequestNotFoundError(fmt.Errorf("No such container: %s", name))
@@ -862,11 +792,21 @@ func attachStreams(plClient *client.PortLayer, name string, tty, stdinOnce bool,
 		}()
 	}
 
-	if clientErrWriter != nil {
+	if clStderr != nil {
+		transport := httptransport.New(PortLayerServer(), "/", []string{"http"})
+		plClient := client.New(transport, nil)
+		transport.Consumers["application/octet-stream"] = httpkit.ByteStreamConsumer()
+		transport.Producers["application/octet-stream"] = httpkit.ByteStreamProducer()
+
 		// Swagger -> pipewriter.  Synchronous, blocking call
 		go func() {
-			getStderrParams := interaction.NewContainerGetStderrParamsWithTimeout(2 * time.Hour).WithID(name)
-			_, err := plClient.Interaction.ContainerGetStderr(getStderrParams, clientErrWriter)
+			getStderrParams := interaction.NewContainerGetStderrParamsWithContext(errContext).WithID(name)
+			_, err := plClient.Interaction.ContainerGetStderr(getStderrParams, clStderr)
+			if clStdin != nil {
+				// Close the client stdin connection (e.g. CLI)
+				clStdin.Close()
+				inCancel()
+			}
 			if err != nil {
 				if _, ok := err.(*interaction.ContainerGetStderrNotFound); ok {
 					errors <- derr.NewRequestNotFoundError(fmt.Errorf("No such container: %s", name))
@@ -888,36 +828,14 @@ func attachStreams(plClient *client.PortLayer, name string, tty, stdinOnce bool,
 
 	// Wait for all stream copy to exit
 	wg.Wait()
-	log.Printf("Attach stream finished")
-	close(errors)
+	log.Printf("Attach stream closed")
+	defer close(errors)
 	for err := range errors {
 		if err != nil {
 			return err
 		}
 	}
 	return nil
-	//	select {
-	//	case err := <-outChan:
-	//		log.Printf("Attach stdout: %s", err)
-	//		if clStdin != nil {
-	//			clStdin.Close()
-	//		}
-	//		return err
-	//	case err := <-errChan:
-	//		log.Printf("Attach stderr: %s", err)
-	//		if clStdin != nil {
-	//			clStdin.Close()
-	//		}
-	//		return err
-	//	case err := <-inChan:
-	//		log.Printf("Attach stdin closed. Closing others")
-	//		return err
-	//	}
-}
-
-func detachStream(plClient *client.PortLayer, name string) {
-	detachParams := interaction.NewContainerDetachParams().WithID(name)
-	plClient.Interaction.ContainerDetach(detachParams)
 }
 
 // Code c/c from io.Copy() modified by Docker to handle escape sequence

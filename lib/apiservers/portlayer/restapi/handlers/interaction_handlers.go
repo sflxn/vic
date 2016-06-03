@@ -15,11 +15,9 @@
 package handlers
 
 import (
-	//	"bufio"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
 
 	"golang.org/x/net/context"
@@ -39,9 +37,6 @@ import (
 // ExecHandlersImpl is the receiver for all of the exec handler methods
 type InteractionHandlersImpl struct {
 	attachServer *attach.Server
-	inStreamMap  map[string]*DetachableReader
-	outStreamMap map[string]*DetachableReader
-	errStreamMap map[string]*DetachableReader
 }
 
 var (
@@ -55,7 +50,6 @@ func (i *InteractionHandlersImpl) Configure(api *operations.PortLayerAPI, _ *Han
 	api.InteractionContainerSetStdinHandler = interaction.ContainerSetStdinHandlerFunc(i.ContainerSetStdinHandler)
 	api.InteractionContainerGetStdoutHandler = interaction.ContainerGetStdoutHandlerFunc(i.ContainerGetStdoutHandler)
 	api.InteractionContainerGetStderrHandler = interaction.ContainerGetStderrHandlerFunc(i.ContainerGetStderrHandler)
-	api.InteractionContainerDetachHandler = interaction.ContainerDetachHandlerFunc(i.ContainerDetachHandler)
 
 	ctx := context.Background()
 	sessionconfig := &session.Config{
@@ -68,10 +62,6 @@ func (i *InteractionHandlersImpl) Configure(api *operations.PortLayerAPI, _ *Han
 		DatastorePath:  options.PortLayerOptions.DatastorePath,
 		NetworkPath:    options.PortLayerOptions.NetworkPath,
 	}
-
-	i.inStreamMap = make(map[string]*DetachableReader)
-	i.outStreamMap = make(map[string]*DetachableReader)
-	i.errStreamMap = make(map[string]*DetachableReader)
 
 	interactionSession, err = session.NewSession(sessionconfig).Create(ctx)
 	if err != nil {
@@ -115,14 +105,13 @@ func (i *InteractionHandlersImpl) ContainerSetStdinHandler(params interaction.Co
 		return interaction.NewContainerSetStdinNotFound().WithPayload(e)
 	}
 
-	detachableIn := NewDetachableReader(params.RawStream)
-	i.inStreamMap[params.ID] = detachableIn
+	detachableIn := NewFlushingReader(params.RawStream)
 	_, err = io.Copy(sshConn.Stdin(), detachableIn)
 	if err != nil {
 		log.Printf("Error copying stdin for container %s", params.ID)
 	}
 
-	log.Printf("*Done copying stdin")
+	log.Printf("Done copying stdin")
 
 	return interaction.NewContainerSetStdinOK()
 }
@@ -135,9 +124,8 @@ func (i *InteractionHandlersImpl) ContainerGetStdoutHandler(params interaction.C
 		return interaction.NewContainerGetStdoutNotFound().WithPayload(e)
 	}
 
-	detachableOut := NewDetachableReader(sshConn.Stdout())
-	i.outStreamMap[params.ID] = detachableOut
-	return NewContainerOutputHandler().WithPayload(detachableOut, params.ID)
+	detachableOut := NewFlushingReader(sshConn.Stdout())
+	return NewContainerOutputHandler("stdout").WithPayload(detachableOut, params.ID)
 }
 
 func (i *InteractionHandlersImpl) ContainerGetStderrHandler(params interaction.ContainerGetStderrParams) middleware.Responder {
@@ -148,26 +136,8 @@ func (i *InteractionHandlersImpl) ContainerGetStderrHandler(params interaction.C
 		return interaction.NewContainerGetStderrNotFound().WithPayload(e)
 	}
 
-	detachableErr := NewDetachableReader(sshConn.Stderr())
-	i.outStreamMap[params.ID] = detachableErr
-	return NewContainerOutputHandler().WithPayload(detachableErr, params.ID)
-}
-
-func (i *InteractionHandlersImpl) ContainerDetachHandler(params interaction.ContainerDetachParams) middleware.Responder {
-	if inReader, ok := i.inStreamMap[params.ID]; ok {
-		inReader.Detach()
-		delete(i.inStreamMap, params.ID)
-	}
-	if outReader, ok := i.outStreamMap[params.ID]; ok {
-		outReader.Detach()
-		delete(i.outStreamMap, params.ID)
-	}
-	if errReader, ok := i.errStreamMap[params.ID]; ok {
-		errReader.Detach()
-		delete(i.errStreamMap, params.ID)
-	}
-
-	return interaction.NewContainerDetachOK()
+	detachableErr := NewFlushingReader(sshConn.Stderr())
+	return NewContainerOutputHandler("stderr").WithPayload(detachableErr, params.ID)
 }
 
 // Custom reader to allow us to detach cleanly during an io.Copy
@@ -176,43 +146,29 @@ type GenericFlusher interface {
 	Flush()
 }
 
-type DetachableReader struct {
+type FlushingReader struct {
 	io.Reader
 	io.WriterTo
 
-	detached bool
-	flusher  GenericFlusher
+	flusher GenericFlusher
 }
 
-func NewDetachableReader(rdr io.Reader) *DetachableReader {
-	return &DetachableReader{Reader: rdr, detached: false, flusher: nil}
+func NewFlushingReader(rdr io.Reader) *FlushingReader {
+	return &FlushingReader{Reader: rdr, flusher: nil}
 }
 
-func (d *DetachableReader) Detach() {
-	d.detached = true
-}
-
-func (d *DetachableReader) AddFlusher(flusher GenericFlusher) {
+func (d *FlushingReader) AddFlusher(flusher GenericFlusher) {
 	d.flusher = flusher
 }
 
 // Derived from go's io.Copy
-func (d *DetachableReader) WriteTo(w io.Writer) (written int64, err error) {
+func (d *FlushingReader) WriteTo(w io.Writer) (written int64, err error) {
 	buf := make([]byte, 64)
 
 	for {
-		if d.detached {
-			err = nil
-			break
-		}
 		nr, er := d.Read(buf)
 		if nr > 0 {
-			if d.detached {
-				err = nil
-				break
-			}
 			nw, ew := w.Write(buf[0:nr])
-			os.Stdout.Write(buf[0:nr])
 			if d.flusher != nil {
 				d.flusher.Flush()
 			}
@@ -241,25 +197,24 @@ func (d *DetachableReader) WriteTo(w io.Writer) (written int64, err error) {
 
 // Custom return handlers for stdout/stderr
 
+type PostCleanup func()
+
 type ContainerOutputHandler struct {
-	outputStream *DetachableReader
+	outputStream *FlushingReader
 	containerID  string
+	outputName   string
 }
 
 // NewContainerSetStdinInternalServerError creates ContainerSetStdinInternalServerError with default headers values
-func NewContainerOutputHandler() *ContainerOutputHandler {
-	return &ContainerOutputHandler{}
+func NewContainerOutputHandler(name string) *ContainerOutputHandler {
+	return &ContainerOutputHandler{outputName: name}
 }
 
 // WithPayload adds the payload to the container set stdin internal server error response
-func (c *ContainerOutputHandler) WithPayload(payload *DetachableReader, id string) *ContainerOutputHandler {
+func (c *ContainerOutputHandler) WithPayload(payload *FlushingReader, id string) *ContainerOutputHandler {
 	c.outputStream = payload
 	c.containerID = id
 	return c
-}
-
-func (c *ContainerOutputHandler) DetachReader() {
-	c.outputStream.Detach()
 }
 
 // WriteResponse to the client
@@ -273,8 +228,8 @@ func (c *ContainerOutputHandler) WriteResponse(rw http.ResponseWriter, producer 
 	_, err := io.Copy(rw, c.outputStream)
 
 	if err != nil {
-		log.Printf("Error copying output for container %s: %s", c.containerID, err)
+		log.Printf("Error copying %s stream for container %s: %s", c.outputName, c.containerID, err)
 	} else {
-		log.Printf("Finished copying stream for container %s", c.containerID)
+		log.Printf("Finished copying %s stream for container %s", c.outputName, c.containerID)
 	}
 }

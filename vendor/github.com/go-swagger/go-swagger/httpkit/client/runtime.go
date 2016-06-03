@@ -183,6 +183,7 @@ func (r *Runtime) Submit(operation *client.Operation) (interface{}, error) {
 	pctx := operation.Context
 	if pctx == nil {
 		pctx = r.Context
+	} else {
 		hasTimeout = true
 	}
 	if pctx == nil {
