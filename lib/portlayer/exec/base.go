@@ -44,6 +44,24 @@ func (e NotYetExistError) Error() string {
 	return fmt.Sprintf("%s is not completely created", e.ID)
 }
 
+// PoweredOffAlready error that is actually a success but has conditions worth examining
+type PoweredOffAlready struct {
+	ID string
+}
+
+func (e PoweredOffAlready) Error() string {
+	return fmt.Sprintf("%s was already powered off", e.ID)
+}
+
+// GuestShuttingDown error indicates the guest is shutting down the container and shutdown request was skipped
+type GuestShuttingDown struct {
+	ID string
+}
+
+func (e GuestShuttingDown) Error() string {
+	return fmt.Sprintf("Power off skipped for %s due to guest shutdown", e.ID)
+}
+
 // containerBase holds fields common between Handle and Container. The fields and
 // methods in containerBase should not require locking as they're primary use is:
 // a. for read-only reference when used in Container
@@ -359,7 +377,8 @@ func (c *containerBase) poweroff(op trace.Operation) error {
 			case *types.InvalidPowerState:
 				if terr.ExistingState == types.VirtualMachinePowerStatePoweredOff {
 					op.Warnf("power off %s task skipped (state was already %s)", c, terr.ExistingState)
-					return nil
+					// return nil
+					return PoweredOffAlready{c.ExecConfig.ID}
 				}
 				op.Warnf("invalid power state during power off: %s", terr.ExistingState)
 
@@ -370,7 +389,8 @@ func (c *containerBase) poweroff(op trace.Operation) error {
 					k := terr.FaultMessage[0].Key
 					if k == vmNotSuspendedKey || k == vmPoweringOffKey {
 						op.Infof("power off %s task skipped due to guest shutdown", c)
-						return nil
+						// return nil
+						return GuestShuttingDown{c.ExecConfig.ID}
 					}
 				}
 				op.Warnf("generic vm config fault during power off: %#v", terr)

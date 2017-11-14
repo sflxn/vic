@@ -95,14 +95,27 @@ func Commit(op trace.Operation, sess *session.Session, h *Handle, waitTime *int3
 			op.Infof("Dropping duplicate power off operation for %s", h.ExecConfig.ID)
 		} else {
 			// stop the container
-			if err := c.stop(op, waitTime); err != nil {
+			err := c.stop(op, waitTime)
+			_, poweredOff := err.(PoweredOffAlready)
+			_, shuttingDown := err.(GuestShuttingDown)
+			if err != nil && !poweredOff && !shuttingDown {
 				return err
+			}
+			if err != nil {
+				op.Infof("Error for %s after stop is %s", h.ExecConfig.ID, err.Error())
 			}
 
 			// we must refresh now to get the new ChangeVersion - this is used to gate on powerstate in the reconfigure
 			// because we cannot set the ExtraConfig if the VM is powered on. There is still a race here unfortunately because
 			// tasks don't appear to contain the new ChangeVersion
 			h.refresh(op)
+
+			// there is a scenario where powering off the container succeeds but the refresh doesn't get the latest
+			// power state.  Perhaps, it's due to host sync.
+			if h.Runtime.PowerState != types.VirtualMachinePowerStatePoweredOff && (poweredOff || shuttingDown) {
+				op.Warnf("ChangeVersion has stale power state.  Replacing powerstate with powered off.")
+				h.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOff
+			}
 
 			// inform of state change irrespective of remaining operations - but allow remaining operations to complete first
 			// to avoid data race on container config

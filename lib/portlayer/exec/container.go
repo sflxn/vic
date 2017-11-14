@@ -455,19 +455,24 @@ func (c *Container) stop(op trace.Operation, waitTime *int32) error {
 
 	err := c.containerBase.stop(op, waitTime)
 	if err != nil {
-		// we've got no idea what state the container is in at this point
-		// running is an _optimistic_ statement
-		// If the current state is Stopping, revert it to the old state.
-		if stateErr := c.transitionState(StateStopping, finalState); stateErr != nil {
-			op.Debugf(stateErr.Error())
+		switch err.(type) {
+		case *PoweredOffAlready:
+			return err
+		case *GuestShuttingDown:
+			// Transition the state to Stopped only if it's Stopping.
+			if err = c.transitionState(StateStopping, StateStopped); err != nil {
+				op.Debugf(err.Error())
+			}
+		default:
+			// we've got no idea what state the container is in at this point
+			// running is an _optimistic_ statement
+			// If the current state is Stopping, revert it to the old state.
+			if stateErr := c.transitionState(StateStopping, finalState); stateErr != nil {
+				op.Debugf(stateErr.Error())
+			}
+
+			return err
 		}
-
-		return err
-	}
-
-	// Transition the state to Stopped only if it's Stopping.
-	if err = c.transitionState(StateStopping, StateStopped); err != nil {
-		op.Debugf(err.Error())
 	}
 
 	return nil

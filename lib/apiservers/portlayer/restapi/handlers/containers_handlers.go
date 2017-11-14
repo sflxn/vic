@@ -336,7 +336,8 @@ func (handler *ContainersHandlersImpl) ContainerSignalHandler(params containers.
 	}
 
 	err := container.Signal(op, params.Signal)
-	if err != nil {
+	_, ok := err.(exec.PoweredOffAlready)
+	if err != nil && !ok {
 		return containers.NewContainerSignalInternalServerError().WithPayload(&models.Error{Message: err.Error()})
 	}
 
